@@ -1,0 +1,1364 @@
+---
+title: "Cancer epidemiology in Geneva - NOT FOR USE"
+author: "Evelyne Fournier"
+format: 
+  dashboard:
+    logo: images/Logo_UNIGE.png
+    nav-buttons: [github]
+    github: https://github.com/YOUR_URL
+theme: lux
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+# To readers :
+# The aim of this project is to analyse cancer evolution in Geneva's canton. It is divided in two sub-project :
+  # - Interactive graphs per cancer subsites 
+  # - Interactive choroplet Map showing the evolution of cancer incidence in Geneva's canton by geographic unit
+# files needed :
+    # cases in each geographic area, by period gender and cancer category (from Geneva Cancer Registry database)
+    # population in each geographic area, by period gender and 5 year age category (from cantonal population office https://statistique.ge.ch)
+    # shapefile of geneva canton by period
+    # European reference population 1976
+    
+# Note 1 : Population by geographic area, by period gender  and 5 year age category was impossible to find. the available data where divided into 3 age categories. The standardised rates computed are not good
+# Note 2 : There was a problem with shapefile found on internet.  errors with ggplotly => just a choroplet map for the latest period
+
+```
+
+```{r, include=FALSE, error=FALSE, warning=FALSE}
+
+
+# Load packages 
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(tidyverse, 
+               here,
+               sf,
+               bslib, 
+               bsicons,
+               rnaturalearth, 
+               plotly, 
+               countrycode, 
+               htmltools, 
+               reactable,
+               janitor, 
+               colorspace,
+               ggspatial,
+               ggsflabel,
+               rgeoboundaries,
+               bfsMaps, #Plot Maps from Switzerland by Swiss Federal Statistical Office
+               readr,
+               readxl,
+               RODBC, # enables data-extraction using an ODBC connection
+               haven, # adds labels values to a numeric variable
+               flextable,
+               flexdashboard,
+               ggiraph, # because ggplotly didnt work for the shapefile found on internet
+               scales,
+               viridis
+               )
+
+```
+
+```{r import and merge patient and tumor and cities files, include=FALSE, error=FALSE, warning=FALSE}
+# Those files are initialy extracted using a R program that can be given given as supplementary data
+# Having those files as csv enables me to work from my personnal computer, independently from the Registry's server
+# Because otherwise a connection to the registry is mandatory
+
+# ----------------------------------------Importation of all files and create 2 dataframes : 
+#- 1 data frame containing the number of patients per tumor type, periode, gender, age category by 5 years categories and periode
+# - 2 data frame containing the number of patients (all kind of invasive cancer except non melanoma skin cancer) per periode, gender, 3 age category  categories, periode and 
+
+
+# patient csv file contains patient ID and gender
+patient<-read_csv(here("data/patient.csv"),show_col_types = FALSE)
+
+  # a_pat_demo csv file contains patient's latest city of residence postal code. It will be used for 25% of cases where tumor postal code GNR is not available. These are essentialy old data. Hypothesis is made that patient  haven't moved out between the address at the date of diagnosis and address at the latest available address)
+  # Import csv file and homogeneise postal code GNR (6999 means unknown)
+
+a_pat_demo<-read_csv(here("data/a_pat_demo.csv") , show_col_types = FALSE) %>% 
+  rename_with(tolower) %>% 
+  rename(gnr_pat=gnr) %>% 
+  mutate(gnr_pat_rec = case_when(
+    gnr_pat==6999 ~ 9999, # we do not want these unknown gnr code to be a problem in future merges
+    is.na(gnr_pat) ~ 9999, # we do not want these missing gnr code to be a problem in future merges
+    TRUE ~ gnr_pat))
+
+# tumor csv files already contains the tumors that we want (only invasive cases from Geneva)
+# it contains patient ID, tumor ID, age at incidence, year of diagnosis, diagnosis code in ICD10, incidence city ID (not gnr) 
+
+tumor<-read_csv(here("data/tumor.csv"),show_col_types = FALSE)
+tabyl(tumor$year)
+
+
+# Table that contains the linkage between city ID and GNR 
+cities<-read_csv(here("data/cities.csv"),show_col_types = FALSE) %>% 
+  arrange(INCIDENCE_CITY_ID) 
+
+
+# Join of patient and a_pat_demo
+patient_with_latest_gnr<-left_join(patient,a_pat_demo,by="pid")
+
+# Join of tumor and city ID. Only cities where a tumor has been registered
+tum_cities<-left_join(tumor,cities,by=("INCIDENCE_CITY_ID")) %>%  
+    dplyr::select(-NPA) %>% 
+    rename_with(tolower) %>% 
+    mutate(gnr_rec = case_when(
+              gnr==6699 ~ 9999,
+              is.na(gnr) ~ 9999,
+              TRUE ~ gnr))
+
+# join of tumors, cities at incidence, patient with latest gnr. Only selected tumors (see annex program for selection details)
+base_registre<-left_join(tum_cities,patient_with_latest_gnr,by=("pid"))  %>% 
+  mutate(gnr_final=case_when(
+            gnr_rec==9999 ~ gnr_pat_rec,
+            TRUE~gnr_rec)) %>% 
+  dplyr::select(-gnr_rec,-gnr_pat_rec,-exp, -gnr_pat, -gnr, -incidence_city_id) %>% 
+            rename(gnr=gnr_final,
+                   geo_unit_name=text_fr)
+
+
+
+# Define the breaks for age categories for standardised rates
+breaks_age_tx_std <- c(0, seq(5, 85, by = 5), Inf)  #  from 0 to 85 and more
+# Define the breaks for age categories for maps
+# Had to do this because population files found only had those 3 age categories, this is a weakness in the geographical analysis
+breaks_age_map <- c(0, 20, 65, Inf)  #  from 0 to 85 and more
+
+## Define custom labels for each age category
+labels_age_tx_std <- c("0-4", "5-9", "10-14", "15-19", "20-24", "25-29", "30-34", "35-39", "40-44", "45-49", "50-54", "55-59", "60-64", "65-69", "70-74", "75-79", "80-84", "85+")
+labels_age_map <- c("0-19", "20-64", "65+")
+
+
+
+# Everything in lowercase, selection of columns
+# Cancer localisation are agregated into tumor categegories
+# those categories are in one hand codes (like C00-C14) in the variable tumor_category, and in the other hand in full text (like ""Lip, Oral Cavity, and Pharynx") in the variable tumor_category_txt
+# Population by geographic area 
+base_registre_clean<-base_registre %>% 
+  rename_with(tolower,everything()) %>% 
+  mutate(icd10=substr(icd10,1,3),   # Cancer localisation ICD10 2 digits
+        gender=as.factor(gender),
+        tumor_category="",
+        tumor_category=case_when(
+           icd10 %in% c("C00", "C01", "C02", "C03", "C04", "C05", "C06", "C07", "C08", "C09",
+                        "C10", "C11", "C12", "C13", "C14") ~ "C00-C14",
+           icd10 == "C15" ~ "C15",
+           icd10 == "C16" ~ "C16",
+           icd10 == "C17" ~ "C17",
+           icd10 %in% c("C18","C19","C20") ~ "C18-C20",
+           icd10 == "C21" ~ "C21",
+           icd10 == "C22" ~ "C22",
+           icd10  %in% c("C23","C24") ~ "C23,C24",
+           icd10 == "C25" ~ "C25",
+           icd10 == "C26" ~ "C26,C80",
+           icd10 == "C32" ~ "C32",
+           icd10  %in% c("C33","C34") ~ "C33-C34",
+           icd10 == "C38" ~ "C38,C45",
+           icd10  %in% c("C40","C41") ~ "C40,C41",
+           icd10 == "C43" ~ "C43",
+           icd10 == "C45" ~ "C38,C45",
+           icd10  %in% c("C47","C49") ~ "C47,C49",
+           icd10 == "C50" ~ "C50",
+           icd10 == "C53" ~ "C53",
+           icd10 %in% c("C54", "C55") ~ "C54,C55",
+           icd10 %in% c("C56", "C57") ~ "C56,C57",
+           icd10 == "C61" ~ "C61",
+           icd10 == "C62" ~ "C62",
+           icd10 %in% c("C64") ~ "C64",
+           icd10 %in% c("C65", "C66", "C68") ~ "C65-C66,C68",
+           icd10 == "C67" ~ "C67",
+           icd10 %in% c("C70", "C71", "C72") ~ "C70-C72",
+           icd10 == "C73" ~ "C73",
+           icd10 == "C80" ~ "C26,C80",
+           icd10 == "C81" ~ "C81",
+           icd10  %in% c("C82", "C83", "C84","C85","C96") ~ "C82-85, C96",
+           icd10 == "C90" ~ "C90",
+           icd10 == "C91" ~ "C91",
+           icd10 == "C92" ~ "C92",
+           icd10  %in% c("C93","C94","C95") ~ "C93-95",
+           TRUE ~ "Other") ,
+      tumor_category=as.factor(tumor_category)) %>% 
+     filter(year>=1989 & year<=2021) %>%  # population data by geographic area only available from 1989
+    mutate(
+    # Construct 3-year periods starting from 1971
+    period = 1989 + (year - 1989) %/% 3 * 3,
+    period=as.factor(period),
+    # Categorize age into defined bins with custom labels
+    cat_age_tx_std = cut(age, breaks = breaks_age_tx_std, right = FALSE,labels =labels_age_tx_std),
+    cat_age_map=  cut(age, breaks = breaks_age_map, right = FALSE,labels =labels_age_map),
+    gnr=as.factor(gnr))
+
+# Check
+# tabyl(base_registre_clean$year)
+# tabyl(base_registre_clean$cat_age_tx_std)
+# tabyl(base_registre_clean$cat_age_map)
+
+```
+
+```{r total number of cases for cancer trend, include=FALSE, error=FALSE, warning=FALSE}
+
+# Agreagation of number of tumors per gender, period, age category, tumor category
+incidence_canton_level <- base_registre_clean %>%
+  group_by(gender, period, cat_age_tx_std, tumor_category, .drop = FALSE) %>%
+  summarise(nbcas = n()) %>%
+  ungroup()
+
+# check
+# tabyl(incidence_canton_level$tumor_category)
+
+#Total number of invasive tumor per gender, period, age category
+
+incidence_canton_level_total_tumors <- base_registre_clean %>%
+  group_by(gender, period, cat_age_tx_std, .drop = FALSE) %>%
+  summarise(nbcas = n()) %>%
+  ungroup() %>% 
+  mutate(tumor_category = "C00-C95")
+
+# Merge of total cancer as a new tumor category
+
+incidence_canton_level_final<-rbind(incidence_canton_level,incidence_canton_level_total_tumors) %>% 
+  mutate(tumor_category_txt="",
+      tumor_category_txt = case_when(
+          tumor_category== "C00-C14" ~ "Lip, Oral Cavity, and Pharynx",
+          tumor_category== "C15" ~ "Esophagus",
+          tumor_category== "C16" ~ "Stomach",
+          tumor_category== "C17" ~ "Small Intestine",
+          tumor_category== "C18-C20" ~ "Colon and Rectum",
+          tumor_category== "C21" ~ "Anus and Anal Canal",
+          tumor_category== "C22" ~ "Liver",
+          tumor_category== "C23,C24" ~ "Gallbladder",
+          tumor_category== "C25" ~ "Pancreas",
+          tumor_category== "C32" ~ "Larynx",
+          tumor_category== "C33-C34" ~ "Lung and Bronchus",
+          tumor_category== "C38,C45" ~ "Pleura and Mesothelioma",
+          tumor_category== "C40,C41" ~ "Bone",
+          tumor_category== "C43" ~ "Skin Melanoma",
+          tumor_category== "C47,C49" ~ "Soft Tissue",
+          tumor_category== "C50" ~ "Breast",
+          tumor_category== "C53" ~ "Cervix Uteri",
+          tumor_category== "C54,C55" ~ "Corpus Uteri",
+          tumor_category== "C56,C57" ~ "Ovary",
+          tumor_category== "C61" ~ "Prostate",
+          tumor_category== "C62" ~ "Testis",
+          tumor_category== "C64" ~ "Kidney",
+          tumor_category== "C65-C66,C68" ~ "Urinary tract",
+          tumor_category== "C67" ~ "Bladder",
+          tumor_category== "C70-C72" ~ "Central Nervous System",
+          tumor_category== "C73" ~ "Thyroid",
+          tumor_category== "C81" ~ "Hodgkin Lymphoma",
+          tumor_category== "C82-85, C96" ~ "Non-Hodgkin Lymphoma",
+          tumor_category== "C90" ~ "Multiple Myeloma",
+          tumor_category== "C91" ~ "Chronic Lymphocytic Leukemia",
+          tumor_category== "C92" ~ "Acute Myeloid Leukemia",
+          tumor_category== "C93-95" ~ "Leukemia",
+          tumor_category== "Other" ~ "Other",
+          tumor_category== "C26,C80" ~ "Unknown Primary Site",
+          tumor_category== "C00-C95" ~ "Total"))
+		    
+# check 13860 obs et 396 row per tumor category
+# tabyl(incidence_canton_level_final$tumor_category)
+```
+
+```{r Population file for standardised incidence rate, include=FALSE, error=FALSE, warning=FALSE}
+# Importation of canton's population file by years and gender
+# contains variable age gender pop year
+pop_GE_1970_2021 <- read_delim("data/pop_GE_1970_2021_Final.csv", 
+    delim = ";", escape_double = FALSE, trim_ws = TRUE,show_col_types = FALSE)
+
+# construction of variables of interest : period, age category
+# filtering for years of interest
+# we get the total population by age category and period and gender
+pop_GE_1989_2021<-pop_GE_1970_2021 %>% 
+  dplyr::filter(year>=1989 & year<=2021) %>% 
+  mutate(period = 1989 + (year - 1989) %/% 3 * 3,
+    period=as.factor(period),
+    cat_age_tx_std = cut(age, breaks = breaks_age_tx_std, right = FALSE,labels =labels_age_tx_std),
+    cat_age_tx_std=as.factor(cat_age_tx_std),
+    gender=as.factor(gender)) %>% 
+  group_by(gender,period,cat_age_tx_std,.drop = FALSE) %>% 
+  summarise(Population=sum(pop))  %>% 
+  ungroup()
+
+# merging of population and cancer cases, by period, gender, age category
+incidence<-inner_join(incidence_canton_level_final,
+                      pop_GE_1989_2021, 
+                      by=(c("gender","period","cat_age_tx_std"))) 
+
+# check
+# tabyl(incidence$period)
+# tabyl(incidence$gender)
+```
+
+```{r European Reference population, include=FALSE, error=FALSE, warning=FALSE  }
+
+
+# I will need to have the reference population in each age category and gender
+# the file only contains 1976 european reference population by age category, without any gender
+refeurope_men <- read_dta("data/refeurope.dta") %>% 
+  mutate(gender="1",
+        gender=as.factor(gender))
+
+
+refeurope_women <- read_dta("data/refeurope.dta") %>% 
+  mutate(gender="2",
+        gender=as.factor(gender))
+
+
+refeurope<-rbind(refeurope_men,refeurope_women) %>% 
+  mutate(cat_age_tx_std = cut(clage, breaks = breaks_age_tx_std, right = FALSE,labels =labels_age_tx_std),
+    cat_age_tx_std=as.factor(cat_age_tx_std))
+tabyl(refeurope$gender)
+# refeurope
+
+# Merge of the european reference population and the incidence DF previously constructed
+
+incidence_def<-left_join(incidence,
+                        refeurope,
+                        by=c("gender","cat_age_tx_std")) %>% 
+                arrange(Population) %>% 
+                select(-clage) 
+
+
+```
+
+```{r Crude and standardised rates for trend, include=FALSE, error=FALSE, warning=FALSE }
+
+# A way of calculating standardized rates is with the PHEindicatormethods package. This package allows  to calculate directly as well as indirectly standardized rates.
+# https://epirhandbook.com/new_pages/standardization.html#standard_all
+
+# Calculate rates per country directly standardized for age and sex
+incidence_ds_rate_phe <- incidence_def %>%
+     group_by(gender,period,tumor_category) %>%
+     PHEindicatormethods::phe_dsr(
+          x = nbcas,                 # column with observed number of events
+          n = Population,             # column with non-standard pops for each stratum
+          stdpop = pop,               # standard populations for each stratum
+          stdpoptype = "field")       # either "vector" for a standalone vector or "field" meaning std populations are in the data  
+
+# we remove female cancer for men and men cancer for women
+incidence_rate<-incidence_ds_rate_phe %>% 
+  arrange(-total_count) %>% 
+  filter(!(gender=="1" & (tumor_category=="C50" |
+                          tumor_category=="C53" |
+                          tumor_category=="C56,C57" )))  %>% 
+  filter(!(gender=="2" & (tumor_category=="C61"|
+                          tumor_category=="C62"))) %>% 
+  rename(std_rate=value)
+           
+
+
+# We will only keep the major cancer site, this will include the total C00-C95
+incidence_rate_major<-incidence_rate %>% 
+filter(period == "2019") %>%
+  group_by(gender) %>%
+  arrange(gender, desc(std_rate)) %>%
+  slice_head(n = 6) %>% # only 6 first 
+  ungroup() %>% 
+  select(gender, tumor_category)
+
+# Because I don't know why but it kept in memory all the levels that are not here anymore
+incidence_rate_major$tumor_category <- factor(incidence_rate_major$tumor_category)
+
+
+# tabyl(incidence_rate_major$tumor_category)    
+# and now we only keep those 6 tumor category in the global incidence file
+incidence_rate_top_6<-inner_join(incidence_rate,
+                                  incidence_rate_major,
+                                  by=c("gender","tumor_category"))
+
+# Again Because I don't know why but it kept in memory levels that were not here anymore
+incidence_rate_top_6$tumor_category <- factor(incidence_rate_top_6$tumor_category)
+                                
+# check
+# tabyl(incidence_rate_top_6$tumor_category)      
+# tabyl(incidence_rate_top_6$period)      
+
+# Ready for graphs
+# Convert period to numeric
+incidence_rate_top_6$period <- as.numeric(as.character(incidence_rate_top_6$period))
+
+
+# preparation of tumor category in text and of labels that will be shown in interactive graphs thanks to tooltip
+incidence_rate_top_6<-incidence_rate_top_6 %>% 
+mutate(tumor_category_txt="",
+      tumor_category_txt = case_when(
+          tumor_category== "C00-C14" ~ "Lip, Oral Cavity, and Pharynx",
+          tumor_category== "C15" ~ "Esophagus",
+          tumor_category== "C16" ~ "Stomach",
+          tumor_category== "C17" ~ "Small Intestine",
+          tumor_category== "C18-C20" ~ "Colon and Rectum",
+          tumor_category== "C21" ~ "Anus and Anal Canal",
+          tumor_category== "C22" ~ "Liver",
+          tumor_category== "C23,C24" ~ "Gallbladder",
+          tumor_category== "C25" ~ "Pancreas",
+          tumor_category== "C32" ~ "Larynx",
+          tumor_category== "C33-C34" ~ "Lung and Bronchus",
+          tumor_category== "C38,C45" ~ "Pleura and Mesothelioma",
+          tumor_category== "C40,C41" ~ "Bone",
+          tumor_category== "C43" ~ "Skin Melanoma",
+          tumor_category== "C47,C49" ~ "Soft Tissue",
+          tumor_category== "C50" ~ "Breast",
+          tumor_category== "C53" ~ "Cervix Uteri",
+          tumor_category== "C54,C55" ~ "Corpus Uteri",
+          tumor_category== "C56,C57" ~ "Ovary",
+          tumor_category== "C61" ~ "Prostate",
+          tumor_category== "C62" ~ "Testis",
+          tumor_category== "C64" ~ "Kidney",
+          tumor_category== "C65-C66,C68" ~ "Urinary tract",
+          tumor_category== "C67" ~ "Bladder",
+          tumor_category== "C70-C72" ~ "Central Nervous System",
+          tumor_category== "C73" ~ "Thyroid",
+          tumor_category== "C81" ~ "Hodgkin Lymphoma",
+          tumor_category== "C82-85, C96" ~ "Non-Hodgkin Lymphoma",
+          tumor_category== "C90" ~ "Multiple Myeloma",
+          tumor_category== "C91" ~ "Chronic Lymphocytic Leukemia",
+          tumor_category== "C92" ~ "Acute Myeloid Leukemia",
+          tumor_category== "C93-95" ~ "Leukemia",
+          tumor_category== "Other" ~ "Other",
+          tumor_category== "C26,C80" ~ "Unknown Primary Site",
+          tumor_category== "C00-C95" ~ "All cancer")) %>% 
+  mutate(std_rate=round(std_rate,1)) %>% 
+  mutate(tooltip_label=paste("Period :",
+                              period,
+                              " - Tumor:",
+                              tumor_category_txt,
+                             " - Rate: ",
+                             std_rate,
+                             sep=" "))
+
+
+```
+
+```{r Plot the incidence evolution for evolution page, include=FALSE, error=FALSE, warning=FALSE}
+#-------------GRAPH FOR MEN
+evo_incidence_men<-incidence_rate_top_6 %>% 
+  filter(gender=="1") %>% 
+  ggplot(aes(x = period, 
+             y = std_rate,
+             text = tooltip_label,
+             color=tumor_category_txt,
+             group = tumor_category_txt )) +
+  geom_line() +
+  labs(title = "Incidence rate over time for men",
+       x = "Period",
+       y = "Standardised incidence Rate",
+       color="Tumor category") +
+  theme_minimal()+
+  scale_x_continuous(breaks=seq(from=1989, to=2021, by=3))
+
+evo_incidence_men
+interactive_gr_evo_incidence_men<-ggplotly(evo_incidence_men, width = 940, tooltip = "text")
+interactive_gr_evo_incidence_men
+
+
+#-------------GRAPH FOR WOMEN
+
+
+evo_incidence_women<-incidence_rate_top_6 %>% 
+  filter(gender=="2") %>% 
+  ggplot(aes(x = period, 
+             y = std_rate,
+             text = tooltip_label,
+             color=tumor_category_txt,
+             group = tumor_category_txt )) +
+  geom_line() +
+  labs(title = "Incidence rate over time for women",
+       x = "Period",
+       y = "Standardised incidence Rate",
+       color="Tumor category") +
+  theme_minimal()+
+  scale_x_continuous(breaks=seq(from=1989, to=2021, by=3))
+
+interactive_gr_evo_incidence_women <- ggplotly(evo_incidence_women, width = 940, tooltip = "text")
+interactive_gr_evo_incidence_women
+
+
+
+```
+
+```{r bar Plot for latest period graph on main page, include=FALSE, error=FALSE, warning=FALSE}
+
+# We will only keep the major cancer site, this will include the total C00-C95
+incidence_rate_major_2019<-incidence_rate %>% 
+filter(period == "2019") %>%
+filter(!(tumor_category=="C00-C95")) %>% 
+filter(!(tumor_category=="Other")) %>% 
+  group_by(gender) %>%
+  arrange(gender, desc(std_rate)) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>% 
+  select(gender, tumor_category, std_rate) %>% 
+mutate(tumor_category_txt="",
+      tumor_category_txt = case_when(
+          tumor_category== "C00-C14" ~ "Lip, Oral Cavity, and Pharynx",
+          tumor_category== "C15" ~ "Esophagus",
+          tumor_category== "C16" ~ "Stomach",
+          tumor_category== "C17" ~ "Small Intestine",
+          tumor_category== "C18-C20" ~ "Colon and Rectum",
+          tumor_category== "C21" ~ "Anus and Anal Canal",
+          tumor_category== "C22" ~ "Liver",
+          tumor_category== "C23,C24" ~ "Gallbladder",
+          tumor_category== "C25" ~ "Pancreas",
+          tumor_category== "C32" ~ "Larynx",
+          tumor_category== "C33-C34" ~ "Lung and Bronchus",
+          tumor_category== "C38,C45" ~ "Pleura and Mesothelioma",
+          tumor_category== "C40,C41" ~ "Bone",
+          tumor_category== "C43" ~ "Skin Melanoma",
+          tumor_category== "C47,C49" ~ "Soft Tissue",
+          tumor_category== "C50" ~ "Breast",
+          tumor_category== "C53" ~ "Cervix Uteri",
+          tumor_category== "C54,C55" ~ "Corpus Uteri",
+          tumor_category== "C56,C57" ~ "Ovary",
+          tumor_category== "C61" ~ "Prostate",
+          tumor_category== "C62" ~ "Testis",
+          tumor_category== "C64" ~ "Kidney",
+          tumor_category== "C65-C66,C68" ~ "Urinary tract",
+          tumor_category== "C67" ~ "Bladder",
+          tumor_category== "C70-C72" ~ "Central Nervous System",
+          tumor_category== "C73" ~ "Thyroid",
+          tumor_category== "C81" ~ "Hodgkin Lymphoma",
+          tumor_category== "C82-85, C96" ~ "Non-Hodgkin Lymphoma",
+          tumor_category== "C90" ~ "Multiple Myeloma",
+          tumor_category== "C91" ~ "Chronic Lymphocytic Leukemia",
+          tumor_category== "C92" ~ "Acute Myeloid Leukemia",
+          tumor_category== "C93-95" ~ "Leukemia",
+          tumor_category== "Other" ~ "Other",
+          tumor_category== "C26,C80" ~ "Unknown Primary Site",
+          tumor_category== "C00-C95" ~ "All cancer")) %>% 
+  mutate(std_rate=round(std_rate,1)) %>% 
+  mutate(tooltip_label=paste(tumor_category,
+                             std_rate,
+                             sep=" : "))
+
+
+#tabyl(incidence_rate_major_2019$tumor_category)  
+# Because I don't know why but it kept in memory levels that were not here anymore
+incidence_rate_major_2019$tumor_category <- factor(incidence_rate_major_2019$tumor_category)
+
+
+#tabyl(incidence_rate_major_2019$tumor_category)    
+
+ data_men <- incidence_rate_major_2019 %>%
+  filter(gender == 1) %>%
+  arrange(desc(std_rate))
+
+# Create the plot
+ # ---------------- FOR MEN
+ gr_top10_men<-data_men %>% 
+  ggplot( aes(x = reorder(tumor_category_txt, std_rate), 
+            y = std_rate, 
+            text = tooltip_label)) +
+  geom_bar(stat = "identity", fill = "#323452") +
+  coord_flip() + # TO HAVE THE HORIZONTAL BARS
+  labs(title = "Most frequent cancers incidence rates for men",
+       x = "",
+       y = "Standardized Rate (per 100 000 person per year)") +
+  theme_minimal()+
+  scale_y_continuous(limits = c(0, 175), 
+                     breaks = seq(0, 175, by = 50), 
+                     minor_breaks = seq(0, 175, 
+                     by = 25), 
+                     expand = c(0, 0.2)) +  # Expand limits to make space for labels) +
+    theme(plot.title = element_text(hjust = 0.5))  # Center the title
+
+ # create interactive graph
+interactive_gr_top10_men<-ggplotly(gr_top10_men, tooltip = "text")
+interactive_gr_top10_men
+
+
+
+
+# ---------------- FOR WOMEN
+ data_women <- incidence_rate_major_2019 %>%
+  filter(gender == 2) %>%
+  arrange(desc(std_rate))
+
+# Create the plot
+gr_top10_women<-data_women %>% 
+ggplot( aes(x = reorder(tumor_category_txt, std_rate), 
+            y = std_rate, 
+            text = tooltip_label)) +
+  geom_bar(stat = "identity", fill = "#00FF00") +
+  coord_flip() + # TO HAVE THE HORIZONTAL BARS
+  labs(title = "Most frequent cancers incidence rates for women",
+       x = " ",
+       y = "Standardized Rate (per 100 000 person per year)") +
+  theme_minimal()+
+  scale_y_continuous(limits = c(0, 175), 
+                     breaks = seq(0, 175, by = 50), 
+                     minor_breaks = seq(0, 175, 
+                     by = 25), 
+                     expand = c(0, 0.2)) +  # Expand limits to make space for labels) +
+    theme(plot.title = element_text(hjust = 0.5))  # Center the title
+
+# create interactive graph
+interactive_gr_top10_women<-ggplotly(gr_top10_women, tooltip = "text")
+interactive_gr_top10_women
+
+
+```
+
+```{r total number of cases for cancer trend by geographic area gender and period, include=FALSE, error=FALSE, warning=FALSE }
+# Now we do the same thing but at the level of each geographic area
+# Agregation of number of tumors per gender, period, age category, geographic area
+incidence_geo_level <- base_registre_clean %>%
+  group_by(gender, period, cat_age_map, gnr, .drop = FALSE) %>%
+  summarise(nbcas = n()) %>%
+  ungroup() 
+
+# check 66 lignes per gnr
+#tabyl(incidence_geo_level$gnr)
+# there are some gnr that do not belong to Geneva, it is because of how the variable was constructed in order to limit missing values on the place of residence
+# they will be removed later
+
+```
+
+```{r population files for map construcion, include=FALSE, error=FALSE, warning=FALSE }
+
+# The population with the different geography units were downloaded from the following websites
+# https://statistique.ge.ch/domaines/01/01_01/tableaux.asp#9
+# https://statistique.ge.ch/statistique/tel/domaines/01/01_01/T_01_01_12_04.xls
+# https://statistique.ge.ch/statistique/tel/domaines/01/01_01/T_01_01_12_04_1989-2013.xls
+
+
+# 2 Excel Files, 1989 to 2012, 2013 to 2023
+# For the file 2013 to 2021, the excel structure is not constant within sheets : Column A to J in 2019->2021 and A to K for 2013=>2018
+# Define the years and file path
+years <- 2019:2021
+file_path <- "data/T_01_01_12_04_sex_3_age_2023_2013.xls"
+
+# Initialize an empty list to store dataframes
+dataframes <- list()
+
+# Loop through each year and read the corresponding sheet
+for (year in years) {
+  # Read the sheet for the current year
+  df <- read_excel(file_path, col_names = FALSE, sheet = as.character(year)) %>%
+    filter(!(is.na(`...2`))) %>%
+    select(-`...6`) %>% 
+    rename(
+      geo_unit_name = `...1`,
+    male_age_group_0_19 = `...2`,
+    male_age_group_20_64 = `...3`,
+    male_age_group_65_plus = `...4`,
+    male_total_population = `...5`,
+    female_age_group_0_19 = `...7`,
+    female_age_group_20_64 = `...8`,
+    female_age_group_65_plus = `...9`,
+    female_total_population = `...10` 
+    ) %>%
+    mutate(year = year)
+    
+  # Assign the dataframe to the list with the name of the dataframe
+  dataframes[[paste0("pop_geographic_unit_", year)]] <- df
+}
+
+# Combine all dataframes into one single dataframe
+merged_dataframe_2019_2021 <- bind_rows(dataframes)
+
+# For 2013-2018
+
+years <- 2013:2018
+file_path <- "data/T_01_01_12_04_sex_3_age_2023_2013.xls"
+
+# Initialize an empty list to store dataframes
+dataframes <- list()
+
+# Loop through each year and read the corresponding sheet
+for (year in years) {
+  # Read the sheet for the current year
+  df <- read_excel(file_path, col_names = FALSE, sheet = as.character(year)) %>%
+    filter(!(is.na(`...3`))) %>%
+    select(-`...2`,-`...7`) %>% 
+    rename(
+    geo_unit_name = `...1`,
+    male_age_group_0_19 = `...3`,
+    male_age_group_20_64 = `...4`,
+    male_age_group_65_plus = `...5`,
+    male_total_population = `...6`,
+    female_age_group_0_19 = `...8`,
+    female_age_group_20_64 = `...9`,
+    female_age_group_65_plus = `...10`,
+    female_total_population = `...11` 
+    ) %>%
+    mutate(year = year)
+    
+  # Assign the dataframe to the list with the name of the dataframe
+  dataframes[[paste0("pop_geographic_unit_", year)]] <- df
+}
+
+
+# Combine all dataframes into one single dataframe
+merged_dataframe_2013_2018 <- bind_rows(dataframes)
+
+
+# Importation of the 2012-1989 database which is on the same format as 2013-2018
+
+
+years <- 1989:2012
+file_path <- "data/T_01_01_12_04_1989-2013.xls"
+
+# Initialize an empty list to store dataframes
+dataframes <- list()
+
+# Loop through each year and read the corresponding sheet
+for (year in years) {
+  # Read the sheet for the current year
+  df <- read_excel(file_path, col_names = FALSE, sheet = as.character(year)) %>%
+    filter(!(is.na(`...3`))) %>%
+    select(-`...2`,-`...7`) %>% 
+    rename(
+     geo_unit_name = `...1`,
+    male_age_group_0_19 = `...3`,
+    male_age_group_20_64 = `...4`,
+    male_age_group_65_plus = `...5`,
+    male_total_population = `...6`,
+    female_age_group_0_19 = `...8`,
+    female_age_group_20_64 = `...9`,
+    female_age_group_65_plus = `...10`,
+    female_total_population = `...11` 
+    ) %>%
+    mutate(year = year)
+  
+  # Assign the dataframe to the list with the name of the dataframe
+  dataframes[[paste0("pop_geographic_unit_", year)]] <- df
+}
+
+# Combine all dataframes into one single dataframe
+merged_dataframe_1989_2012 <- bind_rows(dataframes) 
+
+
+
+# Merge all the population by geographic area and reshape the data to have the age category in a single column
+population_by_geo_area <- bind_rows(merged_dataframe_1989_2012,merged_dataframe_2013_2018,merged_dataframe_2019_2021) %>% 
+  filter(!(is.na(geo_unit_name))) %>% 
+  dplyr::select(-male_total_population,-female_total_population)
+# Age categories and gender are in columns, we need to pivot them
+# Converting from wide to long format
+
+population_by_geo_area2<-population_by_geo_area %>% 
+pivot_longer(
+    cols = starts_with("male") | starts_with("female"),
+    names_to = c("gender", "age_group"),
+    names_sep = "_age_group_",
+    values_to = "Population" ) %>%
+  mutate(gender = ifelse(gender == "male", "1", "2"),
+         cat_age_map=case_when(age_group=="0_19" ~ "0-19",
+                           age_group=="20_64" ~ "20-64",
+                           age_group=="65_plus" ~ "65+"),
+         cat_age_map=as.factor(cat_age_map),
+         gender=as.factor(gender),
+         period = 1989 + (year - 1989) %/% 3 * 3,
+         period=as.factor(period),
+         Population=as.numeric(Population),
+         geo_unit_name=as.factor(geo_unit_name)) %>% 
+    arrange(Population) %>% 
+    dplyr::select(-age_group)
+
+# tabyl(population_by_geo_area2$geo_unit_name)
+# tabyl(population_by_geo_area2$gender)
+# tabyl(population_by_geo_area2$year)
+# tabyl(population_by_geo_area2$period)
+
+# Agregation by period,  gender 
+population_geo_unit<-population_by_geo_area2 %>% 
+  group_by(period,gender,geo_unit_name,cat_age_map,.drop = FALSE) %>% 
+  summarise(tot_pop=sum(Population)) %>% 
+  rename(Population=tot_pop) %>% 
+  mutate(geo_unit_name=as.character(geo_unit_name)) %>% 
+  ungroup() %>% 
+  arrange(Population) %>% 
+  dplyr::filter(!(geo_unit_name=="Canton"))
+  
+# 66 rows per place
+# tabyl(population_geo_unit$geo_unit_name)
+
+
+# the geo_unit_name column contains towns names in letter, we need to find the GNR to map it to the shapefile file
+
+# In our Database, the table cities contains the city name (called text_fr) and GNR 
+cities2<-cities %>% 
+  rename_with(tolower) %>% 
+  rename(geo_unit_name=text_fr) %>% 
+  dplyr::select(-npa,-exp,-incidence_city_id) %>% 
+  distinct(gnr, .keep_all = TRUE) %>% 
+  mutate(geo_unit_name = gsub("\\d+", "", geo_unit_name)) %>% # removes figures from geo_unit_name
+  mutate(geo_unit_name = str_trim(gsub("\\d+", "", geo_unit_name)))  %>% # removes extra space
+  dplyr::filter(gnr<7000 & gnr!=0) 
+
+
+
+setdiff(population_geo_unit$geo_unit_name,cities2$geo_unit_name)
+# [1] "Avusy"              "Dardagny"           "Collex-Bossy"       "Bardonnex"         
+#  [5] "Corsier"            "Perly-Certoux"      "Pregny-Chambésy"    "Collonge-Bellerive"
+#  [9] "Veyrier"            "Grand-Saconnex"     "Meyrin"             "Carouge"           
+# [13] "Lancy" 
+
+setdiff(cities2$geo_unit_name,population_geo_unit$geo_unit_name)
+# [1] "Canton de Genève - Commune inconnue" "Grand-Lancy"                        
+#  [3] "Genève  Aéroport"                    "Vésenaz"                            
+#  [5] "Carouge GE"                          "Vessy"                              
+#  [7] "Collex"                              "Corsier GE"                         
+#  [9] "La Croix-de-Rozon"                   "Perly"                              
+# [11] "La Plaine"                           "Athenaz (Avusy)"                    
+# [13] "Chambésy"   
+# # I don't understand why our city table doesn't have the correct labels and I'm not sure what i am doing is correct, but what I did is check on the internet what label was associated with a given gnr, then label the city table with the label that I found in the internet and is also used in the population_geo_unit file
+
+cities_clean <- cities2 %>% 
+  mutate(geo_unit_name = as.character(geo_unit_name)) %>% 
+  mutate(geo_unit_name=str_trim(geo_unit_name)) %>% 
+  mutate(geo_unit_name = ifelse(geo_unit_name == "Athenaz (Avusy)", "Avusy", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Carouge GE", "Carouge", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Grand-Lancy", "Lancy", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Corsier GE", "Corsier", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Perly", "Perly-Certoux", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Collex", "Collex-Bossy", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Perly", "Perly-Certoux", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Chambésy", "Pregny-Chambésy", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Perly-Certoux-Certoux", "Perly-Certoux", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Genève  Aéroport", "Meyrin", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "La Plaine", "Dardagny", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "La Croix-de-Rozon", "Bardonnex", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Vessy", "Veyrier", geo_unit_name),
+         geo_unit_name = ifelse(geo_unit_name == "Vésenaz", "Collonge-Bellerive", geo_unit_name),
+         geo_unit_name = ifelse(gnr == "6623", "Grand-Saconnex", geo_unit_name),
+         geo_unit_name = ifelse(gnr == "6699", "Commune inconnue", geo_unit_name)) %>% 
+  mutate(gnr=ifelse(gnr == "6699", "9999", gnr)) %>% 
+    arrange( geo_unit_name,gnr) %>% 
+    distinct(geo_unit_name, .keep_all = TRUE) # enabled to see there were some duplicates
+
+
+# identification of differencies in city names between the 2 files
+setdiff(cities_clean$geo_unit_name,population_geo_unit$geo_unit_name)
+#[1] "Commune inconnue"
+
+setdiff(population_geo_unit$geo_unit_name,cities_clean$geo_unit_name)
+ # all town from population_geo_unit are in cities_clean
+
+# checks
+
+# tabyl(population_geo_unit$geo_unit_name) # 2970 lignes
+# # 66 row per town
+# tabyl(population_geo_unit$gender)
+# tabyl(population_geo_unit$cat_age_map)
+# tabyl(population_geo_unit$period)
+# population_geo_unit$gender    n percent
+#                           1 1485     0.5
+#                           2 1485     0.5
+# population_geo_unit$cat_age   n   percent
+#                         0-19 990 0.3333333
+#                        20-64 990 0.3333333
+#                          65+ 990 0.3333333
+# tabyl(population_geo_unit$period)
+ # population_geo_unit$period   n    percent
+ #                       1989 270 0.09090909
+ #                       1992 270 0.09090909
+ #                       1995 270 0.09090909
+ #                       1998 270 0.09090909
+ #                       2001 270 0.09090909
+ #                       2004 270 0.09090909
+ #                       2007 270 0.09090909
+ #                       2010 270 0.09090909
+ #                       2013 270 0.09090909
+ #                       2016 270 0.09090909
+ #                       2019 270 0.09090909
+
+# Merging of population files with cities called with their names to city file
+# expecting a file of 2970 lignes
+population_by_geo_unit_gnr<-left_join(population_geo_unit,cities_clean,by=("geo_unit_name")) %>% 
+  arrange(Population) %>% 
+  mutate(gnr_num=gnr,
+        gnr=as.factor(gnr))
+
+
+# tabyl(population_by_geo_unit_gnr$geo_unit_name)
+# tabyl(population_by_geo_unit_gnr$gnr)
+
+# Perfect
+# now merge this file containing the population with the file containing the cases
+# 2970 rows
+total_cases_and_pop_by_geo<-inner_join(incidence_geo_level,
+                                population_by_geo_unit_gnr,
+                                by=c("gender","period","gnr","cat_age_map")) 
+
+
+
+# Checks
+# tabyl(total_cases_and_pop_by_geo$geo_unit_name) # 2970 lignes
+# # 66 row per town
+# tabyl(total_cases_and_pop_by_geo$gender)
+# tabyl(total_cases_and_pop_by_geo$cat_age_map)
+# tabyl(total_cases_and_pop_by_geo$period)
+
+# tabyl(total_cases_and_pop$gender)
+#  total_cases_and_pop$gender    n percent
+#                           1 1485     0.5
+#                           2 1485     0.5
+# > tabyl(total_cases_and_pop$cat_age)
+#  total_cases_and_pop$cat_age   n   percent
+#                         0-19 990 0.3333333
+#                        20-64 990 0.3333333
+#                          65+ 990 0.3333333
+# > tabyl(total_cases_and_pop$period)
+#  total_cases_and_pop$period   n    percent
+#                        1989 270 0.09090909
+#                        1992 270 0.09090909
+#                        1995 270 0.09090909
+#                        1998 270 0.09090909
+#                        2001 270 0.09090909
+#                        2004 270 0.09090909
+#                        2007 270 0.09090909
+#                        2010 270 0.09090909
+#                        2013 270 0.09090909
+#                        2016 270 0.09090909
+#                        2019 270 0.09090909
+
+# Perfect
+
+```
+
+```{r European Reference population for 3 age categories, include=FALSE, error=FALSE, warning=FALSE }
+library(haven)
+
+# For maps I have only 3 age categories in the population files found on internet
+# So a specific file with european reference population is needed 
+# Moreoever I need to create a dataframe where the reference population has values for male and female so I duplicate the reference population and just add the gender variable for each dataframe, then combine them together
+# maybe not usefull....
+
+refeurope_3_age_cat_men <- read_dta("data/refeurope_3clage.dta")%>% 
+rename(cat_age_numeric=clage) %>% 
+mutate(cat_age_map=case_when(cat_age_numeric==0 ~"0-19",
+                         cat_age_numeric==20 ~"20-64",
+                         cat_age_numeric==65 ~"65+"),
+       gender="1",
+       cat_age_map=as.factor(cat_age_map),
+       gender=as.factor(gender))
+
+
+refeurope_3_age_cat_women <- read_dta("data/refeurope_3clage.dta")%>% 
+ rename(cat_age_numeric=clage) %>% 
+mutate(cat_age_map=case_when(cat_age_numeric==0 ~"0-19",
+                         cat_age_numeric==20 ~"20-64",
+                         cat_age_numeric==65 ~"65+"),
+       gender="2",
+       cat_age_map=as.factor(cat_age_map),
+       gender=as.factor(gender))
+
+
+refeurope_3_age_cat<-rbind(refeurope_3_age_cat_women,refeurope_3_age_cat_men)
+# tabyl(refeurope_3_age_cat$gender)
+
+
+# Merge of the european reference population and the total_cases_and_pop DF previously constructed
+total_cases_and_pop_by_geo_def<-left_join(total_cases_and_pop_by_geo,
+                                   refeurope_3_age_cat,
+                                   by=c("gender","cat_age_map")) %>% 
+                          arrange(Population) %>%  
+                          select(geo_unit_name,gnr,gnr_num,gender,period, cat_age_map,nbcas,Population,pop)
+  # tabyl(total_cases_and_pop_by_geo_def$gender)
+
+
+```
+
+```{r Standardised rates computation by geographic area, include=FALSE, error=FALSE, warning=FALSE }
+
+# Comuptation of standardised incidence rate by geographical area, period and gender using phr_dsr library
+incidence_rate_by_geo_raw <- total_cases_and_pop_by_geo_def %>%
+     group_by(gender,period,gnr) %>%
+     PHEindicatormethods::phe_dsr(
+          x = nbcas,                 # column with observed number of events
+          n = Population,             # column with non-standard pops for each stratum
+          stdpop = pop,               # standard populations for each stratum
+          stdpoptype = "field")       # either "vector" for a standalone vector or "field" meaning std populations are in the data  
+
+incidence_rate_by_geo_raw<-incidence_rate_by_geo_raw %>% 
+  arrange(-total_count)  %>% 
+  rename(std_rate=value)
+
+# The town's name has been lost with phr and need to be imported again
+incidence_rate_by_geo<-inner_join(incidence_rate_by_geo_raw,
+                                   cities_clean,
+                                   by="gnr")
+
+# Now we need to link this file to a shapefile
+```
+
+```{r read shapefile, include=FALSE, error=FALSE, warning=FALSE}
+#https://data.metabolismofcities.org/dashboards/geneva/maps/578032/view/
+# 45 communes
+# numero_com contains city gnr
+
+
+shape_file<-read_sf(here("data/shapefiles/Canton_Genève.shp"))%>% 
+  rename_with(tolower,everything()) %>% 
+  rename(gnr=numero_com) %>% 
+  arrange(gnr)
+shape_file %>% class()
+#tabyl(shape_file$gnr)
+
+# To see if it works
+shape_file %>% 
+ggplot()+geom_sf()+
+  annotation_north_arrow(location="tl")
+
+# Problem
+# One city code 6610 is duplicated on 2 rows, each row having  different geometric attributes
+# It seems I need to agregate the data - chatgpt solution
+
+
+shape_file_grouped <- shape_file %>%
+  group_by(gnr) %>%
+  summarise(geometry = st_union(geometry), .groups = 'drop')
+
+# Check visual implication
+shape_file_grouped %>% 
+ggplot()+geom_sf()+
+  annotation_north_arrow(location="tl")
+
+# It seems there is no difference so it seems to work like this
+# time to merge geometry file with cases files
+# gnr needs to be of the same type in both dataframe
+incidence_rate_by_geo2<-incidence_rate_by_geo %>% 
+  mutate(gnr=as.numeric(as.character(gnr)))
+
+# 990 rows and 11 variables
+# tabyl(incidence_rate_by_geo2$gnr) # 22 rows for each gnr
+# tabyl(incidence_rate_by_geo2$gender) # 2495 rows for each gnr
+# tabyl(incidence_rate_by_geo2$period) # 90 rows for each gnr
+# 
+# tabyl(shape_file_grouped$gnr) # 1 rows for each gnr
+
+
+
+# 990 and 12
+incidence_rate_by_geo2<-incidence_rate_by_geo2 %>% 
+  mutate(gnr=as.numeric(as.character(gnr)))
+
+final_incidence_rate_by_geo<-inner_join(shape_file_grouped,
+                                        incidence_rate_by_geo2,
+                                         by="gnr")
+# checks
+class(final_incidence_rate_by_geo)
+class(shape_file_grouped)
+# Perfect ! now it is time to construct maps
+# Map with 2019 incidence rates
+
+#-----------------------FOR MEN
+final_incidence_rate_by_geo_2019_men<-final_incidence_rate_by_geo %>% 
+  filter(period=="2019" & gender=="1" )
+
+# Check the class of the DF, I had lost the SF property
+class(final_incidence_rate_by_geo_2019_men)
+
+map_incidence_2019_men<-ggplot(data=final_incidence_rate_by_geo_2019_men)+
+  geom_sf(mapping=aes(fill=std_rate))+
+   #scale_fill_gradient(low = "yellow", high = "red") +
+  #scale_fill_viridis(labels = label_number(scale = 1, big.mark=","))+
+  scale_fill_continuous(low = "#BCBCD7", high = "#202235", labels = label_number(scale = 1, big.mark=","))+
+  theme_void()+
+  labs(fill=str_wrap("Standardised rates",width=20),
+       title="Cancer incidence distribution, Men (made-up data)")+
+  ggspatial::annotation_north_arrow(location="br")+
+  ggspatial::annotation_scale(location="bl")+
+ geom_sf_text(mapping=aes(label=str_wrap(geo_unit_name,width = 9)), size=1.5,color="white")
+
+# interactive map --- PROBLEM
+map_incidence_2019_men
+#interactive_map_incidence_2019_men<-ggplotly(map_incidence_2019_men)  
+# Erreur dans st_coordinates.sfc(sf::st_geometry(model)) : 
+#   not implemented for objects of class sfc_GEOMETRY
+#  I did not manage to solve that error so the graph is not interactive
+
+
+
+#-----------------------FOR woMEN
+final_incidence_rate_by_geo_2019_women<-final_incidence_rate_by_geo %>% 
+  filter(period=="2019" & gender=="2" )
+
+# Check the class of the DF, I had lost the SF property
+class(final_incidence_rate_by_geo_2019_women)
+
+map_incidence_2019_women<-ggplot(data=final_incidence_rate_by_geo_2019_women)+
+  geom_sf(mapping=aes(fill=std_rate))+
+ # scale_fill_viridis(option="magma",labels = label_number(scale = 1, big.mark=","))+
+  scale_fill_continuous(low = "#ACFFAC", high = "#006800", labels = label_number(scale = 1, big.mark=","))+
+  theme_void()+
+  labs(fill=str_wrap("Standardised rates",width=20),
+       title="Cancer incidence distribution, Women (made-up data)")+
+  ggspatial::annotation_north_arrow(location="br")+
+  ggspatial::annotation_scale(location="bl")+
+ geom_sf_text(mapping=aes(label=str_wrap(geo_unit_name,width = 9)), size=1.5,color="white")
+
+# interactive map --- PROBLEM
+map_incidence_2019_women
+# ggplotly(map_incidence_2019_women) #interactive mapp
+# Erreur dans st_coordinates.sfc(sf::st_geometry(model)) : 
+#   not implemented for objects of class sfc_GEOMETRY
+
+
+```
+
+```{r Facet maps to show evolution with time for each gender}
+
+
+#prepare the data
+final_incidence_rate_by_geo_1989_2021_men<-final_incidence_rate_by_geo %>% 
+ dplyr::filter(gender==1) 
+ 
+ facet_men<-ggplot(data = final_incidence_rate_by_geo_1989_2021_men) +
+  geom_sf(aes(fill = std_rate)) +
+  facet_wrap(~ period)+
+  scale_fill_continuous(low = "#BCBCD7", high = "#202235", labels = label_number(scale = 1, big.mark=","))+
+  theme_void()+
+  labs(fill=str_wrap("Standardised rates",width=20),
+       title=str_wrap("Cancer incidence rates between 1989 and 2021- made-up data", width=100))
+ 
+ 
+ final_incidence_rate_by_geo_1989_2021_women<-final_incidence_rate_by_geo %>% 
+ dplyr::filter(gender==2) 
+ 
+ facet_women<-ggplot(data = final_incidence_rate_by_geo_1989_2021_women) +
+  geom_sf(aes(fill = std_rate)) +
+  facet_wrap(~ period)+
+  scale_fill_continuous(low = "#ACFFAC", high = "#006800", labels = label_number(scale = 1, big.mark=","))+
+  theme_void()+
+  labs(fill=str_wrap("Standardised rates",width=20),
+       title=str_wrap("Cancer incidence rates between 1989 and 2021- made-up data", width=100))
+```
+
+```{r collection of major figure that will be shown in Welcome page}
+
+
+ cancer_highest_cases_category_men <- incidence_rate_top_6 %>%
+  filter(gender == 1) %>%
+  filter(tumor_category!="C00-C95") %>% 
+  filter(period==2019) %>% 
+  arrange(desc(total_count)) %>% 
+    head(1) %>% 
+   pull(tumor_category_txt)
+
+ cancer_highest_case_value_men <- incidence_rate_top_6 %>%
+   filter(gender == 1) %>%
+  filter(tumor_category!="C00-C95") %>% 
+  filter(period==2019) %>% 
+  arrange(desc(total_count)) %>% 
+   mutate(average_per_year=total_count/3) %>% 
+    head(1) %>% 
+   pull(average_per_year) %>% 
+   round(1)%>%
+  comma()
+
+
+
+ cancer_highest_cases_category_women <- incidence_rate_top_6 %>%
+  filter(gender == 2) %>%
+  filter(tumor_category!="C00-C95") %>% 
+  filter(period==2019) %>% 
+  arrange(desc(total_count)) %>% 
+    head(1) %>% 
+   pull(tumor_category_txt)
+
+ cancer_highest_case_value_women <- incidence_rate_top_6 %>%
+   filter(gender == 2) %>%
+  filter(tumor_category!="C00-C95") %>% 
+  filter(period==2019) %>% 
+  arrange(desc(total_count)) %>% 
+   mutate(average_per_year=total_count/3) %>% 
+    head(1) %>% 
+   pull(average_per_year) %>% 
+   round(1)%>%
+  comma()
+
+ 
+ average_number_cases_men<-incidence_ds_rate_phe %>% 
+  filter(gender == 1 & tumor_category=="C00-C95" & period==2019) %>% 
+   mutate(average_per_year=total_count/3) %>%
+   head(1) %>% 
+   pull(average_per_year) %>% 
+   round(1) %>%
+  comma()
+
+ average_number_cases_women<-incidence_ds_rate_phe %>% 
+  filter(gender == 2 & tumor_category=="C00-C95" & period==2019) %>% 
+   mutate(average_per_year=total_count/3) %>%
+   head(1) %>% 
+   pull(average_per_year) %>% 
+   round(1) %>%
+  comma()
+ 
+  
+
+
+```
+
+# HOME
+
+## Row 1 {height="25%"}
+
+```{r}
+value_box(
+  title = "Average number of invasive cancer cases per year among men (2019-2021)",
+  value = average_number_cases_men,
+  showcase = bsicons::bs_icon("gender-male"),
+  theme = value_box_theme(bg="#323452")
+)
+```
+
+```{r}
+value_box(
+  title = "Most frequent cancer among men",
+  value = cancer_highest_cases_category_men,
+  showcase = bsicons::bs_icon("zoom-in"),
+  theme = value_box_theme(bg="#323452"),
+  p(paste0("(",cancer_highest_case_value_men," cases per year)"))
+)
+```
+
+```{r}
+value_box(
+  title = "Average number of invasive cancer cases per year among women (2019-2021)",
+  value = average_number_cases_women,
+  showcase = bsicons::bs_icon("gender-female"),
+  theme = value_box_theme(bg="#00FF00")
+)
+```
+
+```{r}
+value_box(
+  title = "Most frequent cancer among women",
+  value = cancer_highest_cases_category_women,
+  showcase = bsicons::bs_icon("zoom-in"),
+  theme = value_box_theme(bg="#00FF00"),
+  p(paste0("(",cancer_highest_case_value_women," cases per year)"))
+)
+```
+
+## Row 2 {height="75%"}
+
+###  {width="30%"}
+
+```{r title= "Cancer incidence in Geneva, Men"}
+map_incidence_2019_men
+```
+
+###  {width="40%"}
+
+```{r title= "Most 10 frequent cancers in Geneva (2019-2021)" }
+interactive_gr_top10_men
+interactive_gr_top10_women
+```
+
+###  {width="30%"}
+
+```{r title= "Cancer incidence in Geneva, Women"}
+map_incidence_2019_women
+```
+
+# CANCER EVOLUTION
+
+The graphs below show the evolution of cancer incidence of five major cancer localisations from 1989 to 2021 with a three year periods in Geneva's canton.
+
+```{r}
+interactive_gr_evo_incidence_men
+interactive_gr_evo_incidence_women
+```
+
+# GEOGRAPHIC EVOLUTION
+
+The graphs below show the evolution of (made-up) incidence rates by aera. Further computation need to be done like Kernel Smoothing, Spatial Moving Average , Bayesian Smoothing or Empirical Bayesian smoothing.
+
+
+## Row 1 {height="99%"}
+
+###  {width="50%"}
+
+```{r }
+facet_men
+```
+
+###  {width="50%"}
+
+```{r}
+#facet_men
+facet_women
+```
+
+# DOWNLOAD
+
+The data used in this dashboard is shown below and can be downloaded as a csv.
+
+```{r}
+htmltools::browsable(
+      tagList(
+        reactable(
+          incidence_ds_rate_phe,
+          elementId="incidence_ds_rate_phe",
+          searchable=T,
+          filterable=T),
+tags$button("Download as CSV",
+            onclick="Reactable.downloadDataCSV('incidence_ds_rate_phe')")
+)
+)
+
+
+
+```
+
+# ABOUT
+
+**Cancer evolution**
+
+The data presented on this website are extracted from Geneva's cancer registry database (more about cancer registries on the following page `https://youtu.be/zlV6BYoIwCA`{=html})
+
+The Geneva Cancer Registry (GCR), established in 1970, collects information on all cases of cancer diagnosed within the population of the canton of Geneva. It is the oldest Registry in Switzerland, and one of the oldest in Europe. Data collected by the GCR enables conduction of epidemiological research on cancer, with specific regard to the following: risk factors, evaluation of screening programs and prevention measures, access and quality of care, as well as the effectiveness of treatments. The GCR responds to requests for epidemiological investigations by the local health authorities (e.g. Direction Générale de la Santé) and is involved in several multidisciplinary cancer networks, which include health professionals (from both the public and the private sectors) and patients. The Registry collaborates with national and international studies, on differences within the country, and among countries, in quality of care and survival. The GCR personnel are also involved in teaching undergraduate students, lecturing in workshops, postgraduate and MOOC courses, as well as supervising the Master program, and thesis for the Doctorate in Medicine. In addition, the GCR plays an important role in cancer promotion, registration and epidemiology at national level, having initiated the creation of the National Institute for Cancer Epidemiology and Registration (NICER).
+
+**Cancer maps**
+
+The maps presented on this website do not represent actual data and are intended for educational purposes only. The statistical method used, the population files used (no detailed five-year aged category) and the shape file do not meet scientific requirement. Those three axis need to be improved.
+It was not possible to make interactive maps because of a ggplotly error that hasn't been possible to solve. The error is shown below:
+
+#interactive_map_incidence_2019_men<-ggplotly(map_incidence_2019_men)  
+# Erreur dans st_coordinates.sfc(sf::st_geometry(model)) : 
+#   not implemented for objects of class sfc_GEOMETRY
+
+
+::: {style="max-width:854px"}
+::: {style="position:relative;height:0;padding-bottom:56.25%"}
+<iframe src="https://youtu.be/zlV6BYoIwCA?list=PLaBzsJTguqek8mczlA3eWi1i2FWL9Q7UX" width="854" height="480" style="position:absolute;left:0;top:0;width:100%;height:100%" frameborder="0" scrolling="no" allowfullscreen>
+
+</iframe>
+:::
+:::
+
+# SOURCES
+
+-   Shapefile of Geneva's canton was downloaded from
+
+    https://data.metabolismofcities.org/dashboards/geneva/maps/578032/view/
+
+<br> <!-- Adding extra space -->
+
+-   Population canton with time for three age categories was downloaded from the following websites <br>https://statistique.ge.ch/domaines/01/01_01/tableaux.asp#9 <br>https://statistique.ge.ch/statistique/tel/domaines/01/01_01/T_01_01_12_04.xls <br>https://statistique.ge.ch/statistique/tel/domaines/01/01_01/T_01_01_12_04_1989-2013.xls
+
+<br> <!-- Adding extra space -->
+
+-  Finding color range according to an initial color
+<br>https://www.htmlcsscolor.com/hex/323452
+
+
+# ACKNOWLEDMGENTS
+
+Thank to all The Graph Network team for all this incredible course. The amount of knowledge that you shared is unvaluable. 
+
+I love this course and will be happy to follow all your future courses relating to statistical analysis with R, Python, or any other tool that will be usefull in my field.
+
+```{r save image, include=FALSE, error=FALSE, warning=FALSE}
+
+save.image(file = here("environnement_backup_my_Rproject.RData")) 
+
+
+```
